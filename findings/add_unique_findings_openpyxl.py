@@ -14,15 +14,40 @@ WORKSPACE = Path(__file__).resolve().parents[1]
 SOURCE = WORKSPACE / "findings .xlsx"
 OUTPUT_DIR = WORKSPACE / "outputs" / "unique-findings"
 OUTPUT = OUTPUT_DIR / "findings_with_unique_findings.xlsx"
+SOURCE_SHEET_NAME = "findings "
 SHEET_NAME = "Unique Findings"
 
-# Source column positions (0-based) within columns A..G of the findings sheet.
-FINDING_NAME_COL = 0  # A - Finding Name
-SEVERITY_COL = 5  # F - Severity
-SOLUTION_COL = 6  # G - Solution
+# Source columns are located by their header text (case-insensitive).
+FINDING_NAME_HEADER = "Finding Name"
+SEVERITY_HEADER = "Severity"
+SOLUTION_HEADER = "Solution"
 
 # Highest risk first; any unrecognised value sorts after these.
 SEVERITY_ORDER = ["Critical", "High", "Medium", "Low", "Info", "Informational", "None"]
+
+
+def get_source_sheet(workbook):
+    if SOURCE_SHEET_NAME in workbook.sheetnames:
+        return workbook[SOURCE_SHEET_NAME]
+    # Fall back to the first sheet if the name differs (e.g. no trailing space).
+    return workbook[workbook.sheetnames[0]]
+
+
+def find_columns(header_row):
+    headers = {
+        str(value).strip().lower(): index
+        for index, value in enumerate(header_row)
+        if value is not None
+    }
+    columns = {}
+    for header in (FINDING_NAME_HEADER, SEVERITY_HEADER, SOLUTION_HEADER):
+        if header.lower() not in headers:
+            raise KeyError(
+                f"Column '{header}' not found in the header row. "
+                f"Headers found: {list(headers)}"
+            )
+        columns[header] = headers[header.lower()]
+    return columns
 
 
 def collect_unique_findings():
@@ -31,21 +56,27 @@ def collect_unique_findings():
             f"Source workbook not found: {SOURCE}\n"
             "Place 'findings .xlsx' in the folder one level above this script."
         )
-    workbook = load_workbook(SOURCE, read_only=True, data_only=False)
-    source_sheet = workbook["findings "]
+    workbook = load_workbook(SOURCE, read_only=True, data_only=True)
+    source_sheet = get_source_sheet(workbook)
+    # Exported files often declare a wrong used range; without this, read-only
+    # mode silently stops at the declared last row and most findings are missed.
+    source_sheet.reset_dimensions()
+
+    rows = source_sheet.iter_rows(values_only=True)
+    columns = find_columns(next(rows))
+    name_col = columns[FINDING_NAME_HEADER]
+    severity_col = columns[SEVERITY_HEADER]
+    solution_col = columns[SOLUTION_HEADER]
 
     counts = Counter()
     solutions = defaultdict(Counter)
     severities = defaultdict(Counter)
-    for row in source_sheet.iter_rows(
-        min_row=2,
-        min_col=1,
-        max_col=7,
-        values_only=True,
-    ):
-        finding_name = row[FINDING_NAME_COL]
-        severity = row[SEVERITY_COL]
-        solution = row[SOLUTION_COL]
+    rows_read = 0
+    for row in rows:
+        rows_read += 1
+        finding_name = row[name_col] if name_col < len(row) else None
+        severity = row[severity_col] if severity_col < len(row) else None
+        solution = row[solution_col] if solution_col < len(row) else None
         if finding_name is None or str(finding_name).strip() == "":
             continue
         name = str(finding_name).strip()
@@ -56,7 +87,7 @@ def collect_unique_findings():
             severities[name][str(severity).strip()] += 1
 
     workbook.close()
-    return counts, solutions, severities
+    return counts, solutions, severities, rows_read
 
 
 def severity_rank(severity):
@@ -94,12 +125,15 @@ def combine_solutions(solution_counts):
 
 
 def build_workbook():
-    counts, solutions, severities = collect_unique_findings()
+    print(f"Reading {SOURCE} ...")
+    counts, solutions, severities, rows_read = collect_unique_findings()
+    print(f"Read {rows_read:,} data rows; {len(counts):,} unique findings.")
     rows = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy2(SOURCE, OUTPUT)
 
+    print("Writing the 'Unique Findings' sheet (large files can take a few minutes) ...")
     workbook = load_workbook(OUTPUT)
     if SHEET_NAME in workbook.sheetnames:
         del workbook[SHEET_NAME]
@@ -154,41 +188,37 @@ def build_workbook():
         showColumnStripes=False,
     )
     sheet.add_table(table)
+    workbook.active = workbook.sheetnames.index(SHEET_NAME)
 
     workbook.save(OUTPUT)
     workbook.close()
 
-    validate_output(counts)
+    validate_output(counts, rows_read)
 
 
-def validate_output(counts):
-    workbook = load_workbook(OUTPUT, read_only=True, data_only=False)
-    source_sheet = workbook["findings "]
+def validate_output(counts, rows_read):
+    workbook = load_workbook(OUTPUT, read_only=True, data_only=True)
     unique_sheet = workbook[SHEET_NAME]
+    unique_sheet.reset_dimensions()
 
     output_counts = {}
     for finding_name, _, _, count in unique_sheet.iter_rows(min_row=2, values_only=True):
         output_counts[finding_name] = count
 
-    expected_total = sum(counts.values())
-    actual_total = sum(output_counts.values())
     if output_counts != dict(counts):
         raise AssertionError("Saved unique-finding counts do not match the source aggregation.")
-    if actual_total != expected_total:
-        raise AssertionError("Saved counts do not reconcile to the source row total.")
-    if source_sheet.max_row != 110807 or source_sheet.max_column != 12:
-        raise AssertionError("The original findings sheet dimensions changed unexpectedly.")
 
     result = {
         "output": str(OUTPUT),
         "sheets": workbook.sheetnames,
-        "source_dimensions": [source_sheet.max_row, source_sheet.max_column],
-        "unique_findings_rows": unique_sheet.max_row - 1,
-        "source_rows_counted": actual_total,
+        "source_data_rows": rows_read,
+        "source_rows_counted": sum(output_counts.values()),
+        "unique_findings_rows": len(output_counts),
         "top_five": list(unique_sheet.iter_rows(min_row=2, max_row=6, values_only=True)),
     }
     workbook.close()
     print(json.dumps(result, indent=2, default=str))
+    print(f"\nDone. Open this file to see the '{SHEET_NAME}' sheet:\n{OUTPUT}")
 
 
 if __name__ == "__main__":
